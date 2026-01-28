@@ -1,7 +1,7 @@
-use num_traits::Pow;
+use rand::Rng;
 use std::{
     cell::RefCell,
-    ops::{Add, Div, Mul, Sub},
+    ops::{Add, Div, Mul, Range, Sub},
 };
 
 thread_local! {
@@ -42,7 +42,7 @@ impl Op {
             Sub(a, b) => inputs[a].value - inputs[b].value,
             Mul(a, b) => inputs[a].value * inputs[b].value,
             Div(a, b) => inputs[a].value / inputs[b].value,
-            Pow(a, b) => inputs[a].value.pow(inputs[b].value),
+            Pow(a, b) => inputs[a].value.powf(inputs[b].value),
             Input => return,
         };
     }
@@ -60,11 +60,11 @@ impl Op {
             Mul(..) => (inputs[b].value, inputs[a].value),
             Div(..) => (
                 1. / inputs[b].value,
-                inputs[a].value * -1. * inputs[b].value.pow(-2),
+                inputs[a].value * -1. * inputs[b].value.powf(-2.),
             ),
             Pow(..) => (
-                inputs[b].value * inputs[a].value.pow(inputs[b].value - 1.),
-                inputs[a].value.pow(inputs[b].value) * inputs[a].value.ln(),
+                inputs[b].value * inputs[a].value.powf(inputs[b].value - 1.),
+                inputs[a].value.powf(inputs[b].value) * inputs[a].value.ln(),
             ),
             Input => unreachable!(),
         };
@@ -87,8 +87,10 @@ impl Tape {
         Self { ops: Vec::new() }
     }
 
-    fn clear(&mut self) {
-        self.ops.clear();
+    fn zero_grad(&mut self) {
+        for op in &mut self.ops {
+            op.grad = 0.;
+        }
     }
 
     fn forward(&mut self) {
@@ -111,6 +113,22 @@ impl Tape {
             current.backward(inputs);
         }
     }
+
+    fn requires_grad(&self, tensor: Tensor) -> bool {
+        self.ops[tensor.id].requires_grad
+    }
+
+    fn value(&self, tensor: Tensor) -> f64 {
+        self.ops[tensor.id].value
+    }
+
+    fn grad(&self, tensor: Tensor) -> f64 {
+        self.ops[tensor.id].grad
+    }
+
+    fn value_mut(&mut self, tensor: Tensor) -> &mut f64 {
+        &mut self.ops[tensor.id].value
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -119,30 +137,33 @@ struct Tensor {
 }
 
 impl Tensor {
-    fn constant(value: f64) -> Self {
+    fn new(value: f64, requires_grad: bool) -> Self {
         TAPE.with(|t| {
             let mut tape = t.borrow_mut();
             let id = tape.ops.len();
-            tape.ops.push(Op::new(OpType::Input, value, false));
+            tape.ops.push(Op::new(OpType::Input, value, requires_grad));
             Self { id }
         })
     }
 
+    fn constant(value: f64) -> Self {
+        Self::new(value, false)
+    }
+
     fn var(value: f64) -> Self {
-        TAPE.with(|t| {
-            let mut tape = t.borrow_mut();
-            let id = tape.ops.len();
-            tape.ops.push(Op::new(OpType::Input, value, true));
-            Self { id }
-        })
+        Self::new(value, true)
+    }
+
+    fn rand(range: Range<f64>) -> Self {
+        Self::var(rand::rng().random_range(range))
     }
 
     fn binary_op(self, rhs: Self, op_ctor: impl Fn(usize, usize) -> OpType) -> Self {
         TAPE.with(|t| {
-            let mut tape = t.borrow_mut();
-            let requires_grad = tape.ops[self.id].requires_grad || tape.ops[rhs.id].requires_grad;
-            let id = tape.ops.len();
-            tape.ops
+            let mut t = t.borrow_mut();
+            let requires_grad = t.requires_grad(self) || t.requires_grad(rhs);
+            let id = t.ops.len();
+            t.ops
                 .push(Op::new(op_ctor(self.id, rhs.id), 0.0, requires_grad));
             Self { id }
         })
@@ -177,62 +198,56 @@ impl Div for Tensor {
     }
 }
 
-impl num_traits::Pow<Tensor> for Tensor {
+pub trait Pow<Rhs = Self> {
+    type Output;
+
+    fn pow(self, rhs: Rhs) -> Self::Output;
+}
+
+impl Pow for Tensor {
     type Output = Self;
     fn pow(self, rhs: Tensor) -> Self::Output {
         self.binary_op(rhs, OpType::Pow)
     }
 }
 
-fn linear_regression_mse(data: impl Iterator<Item = (f64, f64)>, w: Tensor, b: Tensor) -> Tensor {
-    let mut err = Tensor::constant(0.);
+fn linear_regression_mse(
+    data: impl IntoIterator<Item = (f64, f64)>,
+    w: Tensor,
+    b: Tensor,
+) -> Tensor {
+    let square = Tensor::constant(2.);
+    let mut err = Tensor::var(0.);
     for (x_val, y_val) in data {
         let x = Tensor::constant(x_val);
         let y = Tensor::constant(y_val);
         let diff = w * x + b - y;
-        err = err + diff.pow(Tensor::constant(2.));
+        err = err + diff.pow(square);
     }
     err
 }
 
 fn main() {
+    // least-squares line: y = 0.264x + 3.011
     let data = [(1., 3.), (2., 4.), (5., 4.), (7., 5.)];
-
-    let mut w_val = 2.;
-    let mut b_val = 3.;
     let alpha = 0.01;
 
-    for _ in 0..1000 {
-        TAPE.with(|t| t.borrow_mut().clear());
+    let w = Tensor::rand(-1. ..1.);
+    let b = Tensor::rand(-1. ..1.);
+    let err = linear_regression_mse(data, w, b);
 
-        let w = Tensor::var(w_val);
-        let b = Tensor::var(b_val);
-        let err = linear_regression_mse(data.into_iter(), w, b);
+    TAPE.with(|t| {
+        for _ in 0..1000 {
+            let mut t = t.borrow_mut();
 
-        TAPE.with(|t| {
-            let mut tape = t.borrow_mut();
-            tape.forward();
-            tape.backward();
+            t.zero_grad();
+            t.forward();
+            t.backward();
 
-            w_val -= alpha * tape.ops[w.id].grad;
-            b_val -= alpha * tape.ops[b.id].grad;
+            *t.value_mut(w) -= alpha * t.grad(w);
+            *t.value_mut(b) -= alpha * t.grad(b);
 
-            // least-squares line: y = 0.263x + 3.01
-            println!(
-                "y = {}x + {}\t err={}",
-                tape.ops[w.id].value, tape.ops[b.id].value, tape.ops[err.id].value
-            );
-        });
-    }
-
-    // f(w, b) = wx + b
-    // f(2, 3) = 2x + 3
-    //
-    // at x=4:
-    //
-    // df/d(wx+b) = 1
-    // df/d(wx) = 1
-    // df/dw = 4
-    // df/db = 1
-    // df/dx = 0
+            println!("y = {}x + {}, err={}", t.value(w), t.value(b), t.value(err));
+        }
+    });
 }
